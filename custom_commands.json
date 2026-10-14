@@ -1,7 +1,37 @@
 [
   {
+    "phrase": "roblox",
+    "action": "open_app",
+    "target": "C:\\Users\\home\\AppData\\Local\\Roblox\\Versions\\version-7a0c6d10fcb34a2c\\RobloxPlayerBeta.exe"
+  },
+  {
     "phrase": "роблокс",
     "action": "open_app",
-    "target": "\"C:\\Users\\home\\AppData\\Local\\Roblox\\Versions\\version-7a0c6d10fcb34a2c\\RobloxPlayerBeta.exe\""
+    "target": "C:\\Users\\home\\AppData\\Local\\Roblox\\Versions\\version-7a0c6d10fcb34a2c\\RobloxPlayerBeta.exe"
+  },
+  {
+    "phrase": "дота",
+    "action": "open_app",
+    "target": "steam://rungameid/570"
+  },
+  {
+    "phrase": "телемост",
+    "action": "open_site",
+    "target": "https://telemost.yandex.ru/"
+  },
+  {
+    "phrase": "звонок",
+    "action": "open_app",
+    "target": "https://telemost.yandex.ru/"
+  },
+  {
+    "phrase": "шахматы",
+    "action": "open_site",
+    "target": "https://www.chess.com/home"
+  },
+  {
+    "phrase": "званок.",
+    "action": "open_app",
+    "target": "https://telemost.yandex.ru/"
   }
 ]
