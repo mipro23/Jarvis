@@ -6,6 +6,7 @@ import time
 import wave
 import subprocess
 import webbrowser
+import os
 from pathlib import Path
 
 import numpy as np
@@ -115,19 +116,32 @@ def run_custom_command(command, voice):
     target_key = target.lower().strip()
 
     if action == "open_app":
-        if target_key not in APPS:
-            return "Для этой команды указано неизвестное приложение."
-        if target_key == "browser":
-            webbrowser.open(SITES["google"])
+        if not target:
+            return "Для этой команды не указано приложение."
+        if target_key in APPS:
+            if target_key == "browser":
+                webbrowser.open(SITES["google"])
+            else:
+                subprocess.Popen(APPS[target_key], shell=False)
         else:
-            subprocess.Popen(APPS[target_key], shell=False)
-        return "Выполняю пользовательскую команду."
+            # Поддерживает путь к .exe и приложения/файлы, зарегистрированные в Windows.
+            try:
+                os.startfile(target)
+            except (OSError, AttributeError):
+                try:
+                    subprocess.Popen([target], shell=False)
+                except (OSError, ValueError):
+                    return f"Не удалось открыть приложение: {target}. Укажи полное имя или путь к .exe."
+        return "Открываю приложение."
 
     if action == "open_site":
-        if target_key not in SITES:
-            return "Для этой команды указан неизвестный сайт."
-        webbrowser.open(SITES[target_key])
-        return "Открываю сайт."
+        if not target:
+            return "Для этой команды не указан адрес сайта."
+        url = target.strip()
+        if not url.lower().startswith(("http://", "https://")):
+            url = "https://" + url
+        opened = webbrowser.open(url)
+        return "Открываю сайт." if opened else "Передал адрес браузеру: " + url
 
     if action == "hotkey":
         allowed_hotkeys = {
@@ -216,7 +230,7 @@ def transcribe(whisper, audio):
 def wait_for_wake_word(whisper):
     """Ожидает имя Алисы и возвращает команду, если она прозвучала сразу."""
     wake_pattern = re.compile(
-        r"\\b(?:алиска|алис|алиса)\\b",
+        r"\b(?:алиска|алис|алиса)\b",
         flags=re.IGNORECASE,
     )
 
@@ -229,7 +243,8 @@ def wait_for_wake_word(whisper):
             continue
 
         print("Слышу:", text, flush=True)
-        match = wake_pattern.search(text.lower().replace("ё", "е"))
+        normalized_text = text.lower().replace("ё", "е")
+        match = wake_pattern.search(normalized_text)
 
         if match:
             # Если пользователь сказал «Алиска, открой ...» одним
@@ -615,14 +630,14 @@ def main():
         compute_type="int8",
     )
 
-    print("\\nДЖАРВИС ГОТОВ.", flush=True)
-    print("Скажи «Алиска», затем команду — можно без паузы.")
+    print("\nДЖАРВИС ГОТОВ.", flush=True)
+    print("Скажи «Алиса», затем команду — можно без паузы.")
     print("Для полной остановки нажми Ctrl+C.")
     print("Для аварийной остановки автоматизации перемести мышь в верхний левый угол.")
 
     try:
         while not stop_requested():
-            print("\\nОжидаю ключевую фразу...", flush=True)
+            print("\nОжидаю ключевую фразу...", flush=True)
             command = wait_for_wake_word(whisper)
 
             if stop_requested():

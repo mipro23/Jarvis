@@ -74,9 +74,10 @@ class CustomCommandsDialog(QDialog):
         layout.addLayout(form)
 
         hint = QLabel(
-            "Параметры: приложение — notepad / calculator / explorer / browser; "
-            "сайт — google / youtube / wikipedia; сочетание — например ctrl+shift+esc; "
-            "фраза — произвольный текст. Для действий без параметра оставь поле пустым."
+            "Приложение: введи название или полный путь к .exe (например notepad, "
+            "Spotify или C:\\Program Files\\App\\app.exe). "
+            "Сайт: введи полный адрес, например https://youtube.com. "
+            "Для сочетаний клавиш используй разрешённые варианты; для действий без параметра поле не нужно."
         )
         hint.setWordWrap(True)
         hint.setObjectName("muted")
@@ -112,8 +113,15 @@ class CustomCommandsDialog(QDialog):
     def refresh_list(self, selected=0):
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
+        action_labels = {value: label for label, value in self.ACTIONS}
         for item in self.commands:
-            self.list_widget.addItem(f"{item.get('phrase', '')}  →  {item.get('action', '')}")
+            phrase = item.get("phrase", "")
+            action = action_labels.get(item.get("action", ""), item.get("action", ""))
+            target = str(item.get("target", "")).strip()
+            summary = f"{phrase}  →  {action}"
+            if target:
+                summary += f" ({target})"
+            self.list_widget.addItem(summary)
         self.list_widget.blockSignals(False)
         if self.commands:
             selected = max(0, min(selected, len(self.commands) - 1))
@@ -141,8 +149,8 @@ class CustomCommandsDialog(QDialog):
     def update_target_hint(self, *_):
         action = self.action_combo.currentData()
         hints = {
-            "open_app": "notepad / calculator / explorer / browser",
-            "open_site": "google / youtube / wikipedia",
+            "open_app": "Название приложения или полный путь к .exe",
+            "open_site": "https://example.com",
             "hotkey": "например ctrl+shift+esc (только разрешённые сочетания)",
             "say": "фраза, которую Алиса произнесёт",
             "minimize_window": "не требуется",
@@ -161,6 +169,8 @@ class CustomCommandsDialog(QDialog):
         if action in ("open_app", "open_site", "hotkey", "say") and not target:
             QMessageBox.warning(self, "Не хватает параметра", "Заполни поле «Параметр действия».")
             return
+        if action == "open_site" and not (target.lower().startswith("https://") or target.lower().startswith("http://")):
+            target = "https://" + target
         row = self.list_widget.currentRow()
         entry = {"phrase": phrase, "action": action, "target": target}
         if 0 <= row < len(self.commands):
