@@ -90,6 +90,90 @@ SITES = {
     "wikipedia": "https://ru.wikipedia.org/",
 }
 
+CUSTOM_COMMANDS_FILE = Path(__file__).parent / "custom_commands.json"
+
+
+def normalize_phrase(text):
+    text = text.lower().replace("ё", "е")
+    return " ".join(re.sub(r"[^\w\s+]+", " ", text).split())
+
+
+def load_custom_commands():
+    try:
+        with open(CUSTOM_COMMANDS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+    except (OSError, json.JSONDecodeError):
+        pass
+    return []
+
+
+def run_custom_command(command, voice):
+    action = command.get("action", "")
+    target = str(command.get("target", "")).strip()
+    target_key = target.lower().strip()
+
+    if action == "open_app":
+        if target_key not in APPS:
+            return "Для этой команды указано неизвестное приложение."
+        if target_key == "browser":
+            webbrowser.open(SITES["google"])
+        else:
+            subprocess.Popen(APPS[target_key], shell=False)
+        return "Выполняю пользовательскую команду."
+
+    if action == "open_site":
+        if target_key not in SITES:
+            return "Для этой команды указан неизвестный сайт."
+        webbrowser.open(SITES[target_key])
+        return "Открываю сайт."
+
+    if action == "hotkey":
+        allowed_hotkeys = {
+            "ctrl+shift+esc": ("ctrl", "shift", "esc"),
+            "win+d": ("win", "d"),
+            "win+e": ("win", "e"),
+            "win+r": ("win", "r"),
+            "ctrl+shift+n": ("ctrl", "shift", "n"),
+            "alt+tab": ("alt", "tab"),
+        }
+        keys = allowed_hotkeys.get(target_key.replace(" ", ""))
+        if not keys:
+            return "Это сочетание клавиш не разрешено. Измени его в настройках команды."
+        pyautogui.hotkey(*keys)
+        return "Выполняю сочетание клавиш."
+
+    if action == "say":
+        if not target:
+            return "Для этой команды не задан текст ответа."
+        speak(voice, target)
+        return ""
+
+    if action == "minimize_window":
+        pyautogui.hotkey("win", "down")
+        return "Сворачиваю активное окно."
+    if action == "maximize_window":
+        pyautogui.hotkey("win", "up")
+        return "Разворачиваю активное окно."
+    if action == "switch_window":
+        pyautogui.hotkey("alt", "tab")
+        return "Переключаю окно."
+    return "Неизвестное действие пользовательской команды."
+
+
+def match_custom_command(text):
+    normalized = normalize_phrase(text)
+    if not normalized:
+        return None
+    # Более длинные фразы проверяются первыми, чтобы избежать совпадений по части фразы.
+    commands = sorted(load_custom_commands(), key=lambda item: len(str(item.get("phrase", ""))), reverse=True)
+    for item in commands:
+        phrase = normalize_phrase(str(item.get("phrase", "")))
+        if phrase and (normalized == phrase or re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", normalized)):
+            return item
+    return None
+
 ALLOWED_ACTIONS = {
     "open_app", "open_site", "minimize_window",
     "maximize_window", "restore_window",
@@ -436,6 +520,19 @@ def parse_response(content):
 def handle_command(text, voice):
     if not text:
         speak(voice, "Я не расслышал команду. Позови меня ещё раз.")
+        return
+
+    custom_command = match_custom_command(text)
+    if custom_command:
+        try:
+            print("Пользовательская команда:", custom_command.get("phrase", ""), flush=True)
+            answer = run_custom_command(custom_command, voice)
+            if answer:
+                print("ДЖАРВИС:", answer, flush=True)
+                speak(voice, answer)
+        except Exception as error:
+            print("Ошибка пользовательской команды:", error, flush=True)
+            speak(voice, "Не удалось выполнить пользовательскую команду.")
         return
 
     # Команды, которые требуют анализа скриншота

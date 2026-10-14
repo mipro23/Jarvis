@@ -1,6 +1,7 @@
 
 import sys
 import os
+import json
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QProcess, QTimer
@@ -16,6 +17,12 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QFrame,
     QSizePolicy,
+    QDialog,
+    QListWidget,
+    QLineEdit,
+    QComboBox,
+    QFormLayout,
+    QMessageBox,
 )
 
 
@@ -23,6 +30,164 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAIN_FILE = os.path.join(BASE_DIR, "main.py")
 PYTHON_EXE = os.path.join(BASE_DIR, ".venv", "Scripts", "python.exe")
 STOP_FLAG = os.path.join(BASE_DIR, "jarvis_stop.flag")
+CUSTOM_COMMANDS_FILE = os.path.join(BASE_DIR, "custom_commands.json")
+
+
+class CustomCommandsDialog(QDialog):
+    """Редактор пользовательских голосовых команд, хранящихся в JSON."""
+    ACTIONS = [
+        ("Открыть приложение", "open_app"),
+        ("Открыть сайт", "open_site"),
+        ("Нажать сочетание клавиш", "hotkey"),
+        ("Сказать фразу голосом", "say"),
+        ("Свернуть активное окно", "minimize_window"),
+        ("Развернуть активное окно", "maximize_window"),
+        ("Переключить окно", "switch_window"),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Мои голосовые команды")
+        self.resize(620, 500)
+        self.commands = self.load_commands()
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Создай фразу, которую Алиса должна услышать после имени, и выбери действие."))
+        self.list_widget = QListWidget()
+        self.list_widget.currentRowChanged.connect(self.select_command)
+        layout.addWidget(self.list_widget, 1)
+
+        form = QFormLayout()
+        self.phrase_input = QLineEdit()
+        self.phrase_input.setPlaceholderText("например: включи рабочий режим")
+        form.addRow("Что услышать:", self.phrase_input)
+
+        self.action_combo = QComboBox()
+        for label, value in self.ACTIONS:
+            self.action_combo.addItem(label, value)
+        self.action_combo.currentIndexChanged.connect(self.update_target_hint)
+        form.addRow("Что сделать:", self.action_combo)
+
+        self.target_input = QLineEdit()
+        self.target_input.setPlaceholderText("например: calculator")
+        form.addRow("Параметр действия:", self.target_input)
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "Параметры: приложение — notepad / calculator / explorer / browser; "
+            "сайт — google / youtube / wikipedia; сочетание — например ctrl+shift+esc; "
+            "фраза — произвольный текст. Для действий без параметра оставь поле пустым."
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("muted")
+        layout.addWidget(hint)
+
+        buttons = QHBoxLayout()
+        self.new_button = QPushButton("＋ Новая")
+        self.new_button.clicked.connect(self.new_command)
+        buttons.addWidget(self.new_button)
+        self.save_button = QPushButton("Сохранить команду")
+        self.save_button.clicked.connect(self.save_current)
+        buttons.addWidget(self.save_button)
+        self.delete_button = QPushButton("Удалить")
+        self.delete_button.clicked.connect(self.delete_current)
+        buttons.addWidget(self.delete_button)
+        layout.addLayout(buttons)
+
+        self.refresh_list()
+        self.update_target_hint()
+
+    def load_commands(self):
+        try:
+            with open(CUSTOM_COMMANDS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except (OSError, json.JSONDecodeError):
+            return []
+
+    def write_commands(self):
+        with open(CUSTOM_COMMANDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(self.commands, f, ensure_ascii=False, indent=2)
+
+    def refresh_list(self, selected=0):
+        self.list_widget.blockSignals(True)
+        self.list_widget.clear()
+        for item in self.commands:
+            self.list_widget.addItem(f"{item.get('phrase', '')}  →  {item.get('action', '')}")
+        self.list_widget.blockSignals(False)
+        if self.commands:
+            selected = max(0, min(selected, len(self.commands) - 1))
+            self.list_widget.setCurrentRow(selected)
+        else:
+            self.new_command()
+
+    def select_command(self, row):
+        if row < 0 or row >= len(self.commands):
+            return
+        item = self.commands[row]
+        self.phrase_input.setText(item.get("phrase", ""))
+        idx = self.action_combo.findData(item.get("action", "say"))
+        self.action_combo.setCurrentIndex(max(0, idx))
+        self.target_input.setText(item.get("target", ""))
+
+    def new_command(self):
+        self.list_widget.setCurrentRow(-1)
+        self.list_widget.clearSelection()
+        self.phrase_input.clear()
+        self.action_combo.setCurrentIndex(0)
+        self.target_input.clear()
+        self.phrase_input.setFocus()
+
+    def update_target_hint(self, *_):
+        action = self.action_combo.currentData()
+        hints = {
+            "open_app": "notepad / calculator / explorer / browser",
+            "open_site": "google / youtube / wikipedia",
+            "hotkey": "например ctrl+shift+esc (только разрешённые сочетания)",
+            "say": "фраза, которую Алиса произнесёт",
+            "minimize_window": "не требуется",
+            "maximize_window": "не требуется",
+            "switch_window": "не требуется",
+        }
+        self.target_input.setPlaceholderText(hints.get(action, ""))
+
+    def save_current(self):
+        phrase = " ".join(self.phrase_input.text().strip().lower().split())
+        action = self.action_combo.currentData()
+        target = self.target_input.text().strip()
+        if not phrase:
+            QMessageBox.warning(self, "Не хватает фразы", "Заполни поле «Что услышать».")
+            return
+        if action in ("open_app", "open_site", "hotkey", "say") and not target:
+            QMessageBox.warning(self, "Не хватает параметра", "Заполни поле «Параметр действия».")
+            return
+        row = self.list_widget.currentRow()
+        entry = {"phrase": phrase, "action": action, "target": target}
+        if 0 <= row < len(self.commands):
+            self.commands[row] = entry
+            selected = row
+        else:
+            self.commands.append(entry)
+            selected = len(self.commands) - 1
+        try:
+            self.write_commands()
+        except OSError as exc:
+            QMessageBox.critical(self, "Ошибка сохранения", str(exc))
+            return
+        self.refresh_list(selected)
+        QMessageBox.information(self, "Готово", "Команда сохранена. Она будет доступна после следующего распознавания.")
+
+    def delete_current(self):
+        row = self.list_widget.currentRow()
+        if row < 0 or row >= len(self.commands):
+            return
+        self.commands.pop(row)
+        try:
+            self.write_commands()
+        except OSError as exc:
+            QMessageBox.critical(self, "Ошибка сохранения", str(exc))
+            return
+        self.refresh_list(max(0, row - 1))
 
 
 class JarvisGUI(QMainWindow):
@@ -115,6 +280,10 @@ class JarvisGUI(QMainWindow):
         self.clear_button = QPushButton("⌫  Очистить чат")
         self.clear_button.clicked.connect(self.clear_chat)
         side.addWidget(self.clear_button)
+
+        self.commands_button = QPushButton("⚙  Мои команды")
+        self.commands_button.clicked.connect(self.open_custom_commands)
+        side.addWidget(self.commands_button)
 
         side.addStretch()
 
@@ -612,6 +781,10 @@ class JarvisGUI(QMainWindow):
             self.stop_button.setEnabled(False)
             self.process_label.setText("Процесс: не запущен")
             self.set_status("ОШИБКА", "statusStopped")
+
+    def open_custom_commands(self):
+        dialog = CustomCommandsDialog(self)
+        dialog.exec()
 
     def clear_chat(self):
         self.chat.clear()
