@@ -1,0 +1,23 @@
+
+# Python и виртуальное окружение
+.venv/
+__pycache__/
+*.py[cod]
+
+# Кэш моделей и распознавания речи
+hf_cache/
+.cache/
+models/
+*.onnx
+*.bin
+*.gguf
+
+# Временные файлы
+*.log
+*.tmp
+jarvis_stop.flag
+
+# Секреты и локальные настройки
+.env
+.env.*
+secrets.json
