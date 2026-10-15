@@ -1,24 +1,149 @@
 import mss
 from PIL import Image
 import json
+import os
 import re
+import sys
 import time
 import wave
 import subprocess
 import webbrowser
-import os
+import urllib.request
+import urllib.error
+from urllib.parse import urljoin
 from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
 import pyautogui
-from pathlib import Path
+
+import config
 
 STOP_FLAG = Path(__file__).parent / "jarvis_stop.flag"
+TEXT_COMMAND_DIR = Path(__file__).parent / "jarvis_text_commands"
 
 
 def stop_requested():
     return STOP_FLAG.exists()
+
+
+def pop_text_command():
+    """Забирает текстовую команду, отправленную из GUI, если она есть.
+
+    Каждая команда — отдельный .txt-файл в TEXT_COMMAND_DIR; обрабатываются
+    по одному в порядке создания, файл удаляется после чтения.
+    """
+    try:
+        files = sorted(TEXT_COMMAND_DIR.glob("*.txt"))
+    except OSError:
+        return None
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+            path.unlink()
+        except OSError:
+            continue
+        if text:
+            return text
+    return None
+
+
+def clear_text_commands():
+    """Удаляет необработанные текстовые команды от прошлого запуска."""
+    try:
+        for path in TEXT_COMMAND_DIR.glob("*.txt"):
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def cloud_ai_enabled():
+    cfg = config.load_config()
+    return bool(cfg.get("cloud_enabled") and cfg.get("api_key") and cfg.get("model"))
+
+
+def ask_cloud_ai(text):
+    """Вызов API, совместимого с форматом OpenAI Chat Completions."""
+    cfg = config.load_config()
+    api_key = str(cfg.get("api_key", "")).strip()
+    model = str(cfg.get("model", "")).strip()
+    base_url = str(cfg.get("base_url", "https://api.groq.com/openai/v1")).strip().rstrip("/")
+    if not api_key or not model or not base_url:
+        raise RuntimeError("Облачный ИИ не настроен. Открой настройки и укажи API-ключ и модель.")
+
+    endpoint = base_url
+    if not endpoint.endswith("/chat/completions"):
+        endpoint += "/chat/completions"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Ты Джарвис, голосовой помощник пользователя. "
+                    "Отвечай по-русски, понятно и по существу. "
+                    "Не утверждай, что выполнял действия на компьютере. "
+                    "Ты не можешь самостоятельно запускать программы или менять Windows."
+                ),
+            },
+            {"role": "user", "content": text},
+        ],
+        "temperature": 0.4,
+        "max_tokens": int(cfg.get("max_tokens", 700)),
+    }
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    timeout = max(5, min(int(cfg.get("timeout_seconds", 35)), 90))
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    answer = result["choices"][0]["message"]["content"]
+    if isinstance(answer, list):
+        answer = " ".join(
+            part.get("text", "") for part in answer if isinstance(part, dict)
+        )
+    answer = str(answer).strip()
+    if not answer:
+        raise RuntimeError("Облачная модель вернула пустой ответ.")
+    return answer
+
+
+def should_use_cloud(text):
+    """Маршрутизация вопросов в облако; команды Windows остаются локальными."""
+    cfg = config.load_config()
+    if not (cfg.get("cloud_enabled") and cfg.get("api_key") and cfg.get("model")):
+        return False
+
+    normalized = re.sub(r"[!?.,;:]+$", "", text.lower().replace("ё", "е").strip())
+    # Команды управления компьютером всегда обрабатываются локальной логикой.
+    local_command_starts = (
+        "открой", "открыть", "запусти", "запустить", "включи", "выключи",
+        "сверни", "разверни", "восстанови", "переключи", "закрой",
+        "перейди", "зайди", "покажи рабочий стол", "сделай скриншот",
+        "посмотри на экран", "что на экране", "прочитай экран",
+    )
+    if normalized.startswith(local_command_starts):
+        return False
+
+    question_starts = (
+        "почему", "зачем", "как", "что такое", "расскажи", "объясни",
+        "сравни", "придумай", "напиши", "помоги", "посоветуй",
+        "кто такой", "кто такая", "когда", "где", "какой", "какая",
+        "какие", "сколько", "для чего", "в чем", "в чём",
+    )
+    if "?" in text or normalized.startswith(question_starts):
+        return True
+
+    # Длинные формулировки обычно являются вопросами/задачами, а не командами.
+    return len(normalized.split()) >= 9
+
 
 from faster_whisper import WhisperModel
 from ollama import chat
@@ -27,16 +152,18 @@ from piper import PiperVoice
 
 # ============== НАСТРОЙКИ ==============
 
-MODEL = "qwen2.5:7b"
-VOICE_MODEL = r"C:\Jarvis\ru_RU-irina-medium.onnx"
+CFG = config.load_config()
+
+MODEL = str(CFG.get("ollama_model") or config.DEFAULTS["ollama_model"])
 
 SAMPLE_RATE = 16000
-MIC_DEVICE = 1
+
+# Индекс выбирается при запуске по списку реальных устройств (choose_microphone);
+# None означает системный microphone по умолчанию.
+MIC_DEVICE = None
 
 # Частота проверки ключевого слова и длительность команды
 WAKE_CHUNK_SECONDS = 2
-
-SAMPLE_RATE = 16000
 
 # Сколько тишины означает, что фраза закончилась
 END_SILENCE_SECONDS = 0.8
@@ -51,14 +178,10 @@ MIN_SPEECH_SECONDS = 0.25
 PRE_ROLL_SECONDS = 0.3
 
 # Минимальная громкость речи; при необходимости настроим
-SPEECH_THRESHOLD = 0.012
+SPEECH_THRESHOLD = 0.006
 
 
-WAKE_WORDS = (
-    "алиска",
-    "алис",
-    "алиса",
-)
+WAKE_WORDS = tuple(config.get_wake_words(CFG))
 
 SYSTEM = """
 Ты Джарвис — локальный голосовой помощник Windows 11.
@@ -110,6 +233,55 @@ def load_custom_commands():
     return []
 
 
+ROBLOX_PROTOCOL = "roblox://"
+
+
+def find_start_menu_shortcut(word):
+    """Ищет ярлык в меню «Пуск» по слову в имени файла."""
+    folders = []
+    appdata = os.environ.get("APPDATA")
+    programdata = os.environ.get("PROGRAMDATA")
+    if appdata:
+        folders.append(Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs")
+    if programdata:
+        folders.append(Path(programdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs")
+    for folder in folders:
+        if not folder.is_dir():
+            continue
+        try:
+            for shortcut in folder.rglob("*.lnk"):
+                if word in shortcut.name.lower():
+                    return shortcut
+        except OSError:
+            continue
+    return None
+
+
+def recover_app_launch(target):
+    """Резервный запуск, когда файл из пользовательской команды больше не существует.
+
+    Установщик Roblox меняет каталог версии, поэтому путь вида
+    ...\\Roblox\\Versions\\version-<хэш>\\... со временем ломается. Пробуем
+    зарегистрированный протокол roblox:// и ярлык из меню «Пуск».
+    Возвращает текст ответа пользователю или None, если способ не найден.
+    """
+    if "roblox" not in target.lower():
+        return None
+    try:
+        os.startfile(ROBLOX_PROTOCOL)
+        return "Запускаю Roblox через зарегистрированную ссылку roblox://."
+    except OSError:
+        pass
+    shortcut = find_start_menu_shortcut("roblox")
+    if shortcut is not None:
+        try:
+            os.startfile(str(shortcut))
+            return "Запускаю Roblox через ярлык из меню «Пуск»."
+        except OSError:
+            pass
+    return None
+
+
 def run_custom_command(command, voice):
     action = command.get("action", "")
     target = str(command.get("target", "")).strip()
@@ -131,6 +303,9 @@ def run_custom_command(command, voice):
                 try:
                     subprocess.Popen([target], shell=False)
                 except (OSError, ValueError):
+                    recovered = recover_app_launch(target)
+                    if recovered:
+                        return recovered
                     return f"Не удалось открыть приложение: {target}. Укажи полное имя или путь к .exe."
         return "Открываю приложение."
 
@@ -167,12 +342,15 @@ def run_custom_command(command, voice):
     if action == "minimize_window":
         pyautogui.hotkey("win", "down")
         return "Сворачиваю активное окно."
+
     if action == "maximize_window":
         pyautogui.hotkey("win", "up")
         return "Разворачиваю активное окно."
+
     if action == "switch_window":
         pyautogui.hotkey("alt", "tab")
         return "Переключаю окно."
+
     return "Неизвестное действие пользовательской команды."
 
 
@@ -187,6 +365,7 @@ def match_custom_command(text):
         if phrase and (normalized == phrase or re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", normalized)):
             return item
     return None
+
 
 ALLOWED_ACTIONS = {
     "open_app", "open_site", "minimize_window",
@@ -228,36 +407,35 @@ def transcribe(whisper, audio):
 
 
 def wait_for_wake_word(whisper):
-    """Ожидает имя Алисы и возвращает команду, если она прозвучала сразу."""
-    wake_pattern = re.compile(
-        r"\b(?:алиска|алис|алиса)\b",
-        flags=re.IGNORECASE,
-    )
+    """Ожидает слово пробуждения «Джарвис».
 
-    while not stop_requested():
-        # Короткие фрагменты уменьшают задержку реакции.
-        audio = record_audio(1.5)
+    Возвращает текстовую команду из GUI, если она пришла во время ожидания,
+    иначе None. Stop-флаг проверяется на каждом шаге для быстрой остановки.
+    """
+    while True:
+        if stop_requested():
+            return None
+
+        text_command = pop_text_command()
+        if text_command:
+            print("Ты (текст):", text_command, flush=True)
+            return text_command
+
+        audio = record_audio(3)
         text = transcribe(whisper, audio)
 
         if not text:
             continue
 
         print("Слышу:", text, flush=True)
-        normalized_text = text.lower().replace("ё", "е")
-        match = wake_pattern.search(normalized_text)
 
-        if match:
-            # Если пользователь сказал «Алиска, открой ...» одним
-            # предложением, сразу передаём остаток как команду.
-            original_match = wake_pattern.search(text)
-            if original_match:
-                remainder = text[original_match.end():].strip(" ,.!?:;—-")
-            else:
-                remainder = ""
+        normalized = re.sub(r"[^\w\s]", " ", text.lower())
+        words = normalized.split()
 
-            return remainder
+        if any(word in WAKE_WORDS for word in words):
+            return None
 
-    return ""
+
 
 
 
@@ -289,7 +467,7 @@ def listen_for_command(whisper):
     # Сначала оцениваем фоновый шум
     noise_levels = []
 
-    print("Слушаю команду. Говори после сигнала...")
+    print("СЛУШАЮ КОМАНДУ: говори сейчас.", flush=True)
 
     try:
         with sd.InputStream(
@@ -302,6 +480,11 @@ def listen_for_command(whisper):
 
             while True:
                 data, overflowed = stream.read(block_size)
+                if overflowed:
+                    print("Предупреждение: микрофон не успевает передавать аудио.", flush=True)
+                if stop_requested():
+                    return ""
+
                 chunk = data[:, 0].copy()
 
                 elapsed = time.monotonic() - start_time
@@ -320,9 +503,11 @@ def listen_for_command(whisper):
                     float(np.median(noise_levels))
                     if noise_levels else 0.0
                 )
+                # Более мягкий адаптивный порог: 0.012 был слишком высоким
+                # для некоторых встроенных микрофонов и тихой речи.
                 threshold = max(
                     SPEECH_THRESHOLD,
-                    noise_level * 3.0,
+                    noise_level * 2.5,
                 )
 
                 rms = float(np.sqrt(np.mean(chunk * chunk)))
@@ -336,7 +521,7 @@ def listen_for_command(whisper):
                         audio_parts.extend(list(pre_roll))
                         speech_blocks = 1
                         silence_blocks = 0
-                        print("Речь обнаружена...")
+                        print("РЕЧЬ ОБНАРУЖЕНА, записываю...", flush=True)
                     continue
 
                 audio_parts.append(chunk)
@@ -360,12 +545,12 @@ def listen_for_command(whisper):
         return ""
 
     if not speech_started or not audio_parts:
-        print("Речь не обнаружена.")
+        print("РЕЧЬ НЕ ОБНАРУЖЕНА: проверь громкость и устройство микрофона.", flush=True)
         return ""
 
     audio = np.concatenate(audio_parts).astype(np.float32)
 
-    print("Распознаю команду...")
+    print("РАСПОЗНАЮ КОМАНДУ...", flush=True)
     text = transcribe(whisper, audio)
 
     if text:
@@ -434,7 +619,7 @@ def look_at_screen(question="Что сейчас видно на экране?")
                 {
                     "role": "user",
                     "content": (
-                        "Ты — зрение локального помощника Алиски. "
+                        "Ты — зрение локального помощника Джарвиса. "
                         "Опиши только то, что действительно видно "
                         "на скриншоте. Отвечай по-русски, кратко. "
                         "Не утверждай, что выполнил действия. "
@@ -565,12 +750,23 @@ def handle_command(text, voice):
     normalized_text = text.lower().replace("ё", "е")
 
     if any(phrase in normalized_text for phrase in vision_phrases):
-        print("Алиска смотрит на экран...")
+        print("Джарвис смотрит на экран...")
         answer = look_at_screen(text)
-        print("АЛИСКА:", answer, flush=True)
+        print("ДЖАРВИС:", answer, flush=True)
         speak(voice, answer)
         return
 
+
+    if should_use_cloud(text):
+        try:
+            print("Отправляю сложный вопрос в облачную модель...", flush=True)
+            answer = ask_cloud_ai(text)
+            print("ДЖАРВИС:", answer, flush=True)
+            speak(voice, answer)
+            return
+        except Exception as error:
+            print("Облачный ИИ недоступен, переключаюсь на Ollama:", error, flush=True)
+            # Ниже выполняется существующая локальная обработка через Ollama.
 
     if text.lower().strip() in (
         "выход", "остановись", "завершить работу",
@@ -618,10 +814,40 @@ def handle_command(text, voice):
 
 # ============== ЗАПУСК ==============
 
+def choose_microphone():
+    """Выбирает микрофон из настроек; при проблемах — системный по умолчанию."""
+    global MIC_DEVICE
+    devices = config.list_input_devices()
+    MIC_DEVICE, warning = config.select_microphone(CFG, devices)
+    if warning:
+        print(warning, flush=True)
+    if MIC_DEVICE is None:
+        print("Микрофон: системный по умолчанию.", flush=True)
+    else:
+        name = next(
+            (d["name"] for d in devices if d.get("index") == MIC_DEVICE), "?"
+        )
+        print(f"Микрофон: [{MIC_DEVICE}] {name}", flush=True)
+
+
 def main():
+    problem = config.config_problem()
+    if problem:
+        print("ВНИМАНИЕ:", problem, flush=True)
+
+    for message in config.validate_config(CFG):
+        print("ВНИМАНИЕ:", message, flush=True)
+
+    voice_model_path, voice_error = config.resolve_voice_model(CFG)
+    if voice_error:
+        print("ОШИБКА:", voice_error, flush=True)
+        sys.exit(1)
+
+    choose_microphone()
+
     print("=" * 45)
     print("Загружаю голос Piper...")
-    voice = PiperVoice.load(VOICE_MODEL)
+    voice = PiperVoice.load(str(voice_model_path))
 
     print("Загружаю Faster-Whisper...")
     whisper = WhisperModel(
@@ -631,27 +857,39 @@ def main():
     )
 
     print("\nДЖАРВИС ГОТОВ.", flush=True)
-    print("Скажи «Алиса», затем команду — можно без паузы.")
+    print("Скажи «Джарвис», затем произнеси команду, или напиши команду в окне программы.")
     print("Для полной остановки нажми Ctrl+C.")
     print("Для аварийной остановки автоматизации перемести мышь в верхний левый угол.")
+
+    clear_text_commands()
 
     try:
         while not stop_requested():
             print("\nОжидаю ключевую фразу...", flush=True)
-            command = wait_for_wake_word(whisper)
+            text_command = wait_for_wake_word(whisper)
 
             if stop_requested():
                 break
 
-            # Если команда не прозвучала вместе с именем, начинаем слушать сразу.
+            if text_command:
+                handle_command(text_command, voice)
+                continue
+
+            speak(voice, "Да, слушаю.")
+
+            if stop_requested():
+                break
+
+            command = listen_for_command(whisper)
+
             if not command:
-                command = listen_for_command(whisper)
+                print("Команда не получена. Возвращаюсь к ожиданию ключевого слова.", flush=True)
+                continue
 
             if stop_requested():
                 break
 
-            if command:
-                handle_command(command, voice)
+            handle_command(command, voice)
 
     except KeyboardInterrupt:
         print("\nЗавершаю работу Джарвиса...")

@@ -2,12 +2,12 @@
   {
     "phrase": "roblox",
     "action": "open_app",
-    "target": "C:\\Users\\home\\AppData\\Local\\Roblox\\Versions\\version-7a0c6d10fcb34a2c\\RobloxPlayerBeta.exe"
+    "target": "roblox://"
   },
   {
     "phrase": "роблокс",
     "action": "open_app",
-    "target": "C:\\Users\\home\\AppData\\Local\\Roblox\\Versions\\version-7a0c6d10fcb34a2c\\RobloxPlayerBeta.exe"
+    "target": "roblox://"
   },
   {
     "phrase": "дота",
@@ -33,5 +33,10 @@
     "phrase": "званок.",
     "action": "open_app",
     "target": "https://telemost.yandex.ru/"
+  },
+  {
+    "phrase": "почта",
+    "action": "open_site",
+    "target": "https://mail.google.com/mail/u/0/#inbox"
   }
 ]

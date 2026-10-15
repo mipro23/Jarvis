@@ -4,7 +4,8 @@ import os
 import json
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QProcess, QTimer
+import config
+from PySide6.QtCore import Qt, QProcess, QTimer, QThread, Signal
 from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -21,8 +22,11 @@ from PySide6.QtWidgets import (
     QListWidget,
     QLineEdit,
     QComboBox,
+    QCheckBox,
     QFormLayout,
     QMessageBox,
+    QSystemTrayIcon,
+    QStyle,
 )
 
 
@@ -31,6 +35,7 @@ MAIN_FILE = os.path.join(BASE_DIR, "main.py")
 PYTHON_EXE = os.path.join(BASE_DIR, ".venv", "Scripts", "python.exe")
 STOP_FLAG = os.path.join(BASE_DIR, "jarvis_stop.flag")
 CUSTOM_COMMANDS_FILE = os.path.join(BASE_DIR, "custom_commands.json")
+TEXT_COMMAND_DIR = os.path.join(BASE_DIR, "jarvis_text_commands")
 
 
 class CustomCommandsDialog(QDialog):
@@ -47,8 +52,6 @@ class CustomCommandsDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Мои голосовые команды")
-        self.resize(620, 500)
         self.commands = self.load_commands()
 
         layout = QVBoxLayout(self)
@@ -200,6 +203,209 @@ class CustomCommandsDialog(QDialog):
         self.refresh_list(max(0, row - 1))
 
 
+
+class ApiTestWorker(QThread):
+    finished_text = Signal(bool, str)
+
+    def __init__(self, base_url, api_key, model, parent=None):
+        super().__init__(parent)
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model = model
+
+    def run(self):
+        import json
+        import urllib.request
+        import urllib.error
+        endpoint = self.base_url
+        if not endpoint.endswith("/chat/completions"):
+            endpoint += "/chat/completions"
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "Ответь одним словом: работает"}],
+            "max_tokens": 20,
+            "temperature": 0,
+        }
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            answer = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            self.finished_text.emit(True, "Подключение работает. Ответ: " + str(answer)[:160])
+        except Exception as exc:
+            self.finished_text.emit(False, f"Не удалось подключиться: {exc}")
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Настройки Джарвиса")
+        self.setMinimumWidth(560)
+        self.worker = None
+        current = config.load_config()
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Микрофон и параметры OpenAI-совместимого API. "
+            "Локальные команды Windows и Ollama останутся доступными."
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName("muted")
+        layout.addWidget(intro)
+
+        identity_form = QFormLayout()
+        self.assistant_name = QLineEdit(str(current.get("assistant_name", "Джарвис")))
+        self.assistant_name.setPlaceholderText("Например: Нексус")
+        self.wake_word = QLineEdit(str(current.get("wake_word", "джарвис")))
+        self.wake_word.setPlaceholderText("Слова через запятую, например: нексус, помощник")
+        self.volume = QComboBox()
+        self.volume.addItems(["25", "40", "55", "70", "85", "100"])
+        self.volume.setCurrentText(str(current.get("voice_volume", 85)))
+        identity_form.addRow("Имя ассистента:", self.assistant_name)
+        identity_form.addRow("Слово пробуждения:", self.wake_word)
+        identity_form.addRow("Громкость голоса (%):", self.volume)
+        layout.addLayout(identity_form)
+
+        mic_form = QFormLayout()
+        devices = config.list_input_devices()
+        self.mic_device = QComboBox()
+        self.mic_device.addItem("По умолчанию (системный)", None)
+        for device in devices:
+            self.mic_device.addItem(
+                f'[{device["index"]}] {device["name"]}', device["index"]
+            )
+        saved_mic = current.get("mic_device")
+        position = self.mic_device.findData(saved_mic)
+        if saved_mic is not None and position < 0:
+            # Сохранённого микрофона нет в системе — предупреждаем,
+            # а не подставляем случайное устройство.
+            self.mic_device.setItemText(
+                0, "По умолчанию (сохранённый микрофон не найден)"
+            )
+            position = 0
+        self.mic_device.setCurrentIndex(position if position >= 0 else 0)
+        mic_form.addRow("Микрофон:", self.mic_device)
+        layout.addLayout(mic_form)
+
+        self.enabled = QCheckBox("Использовать облачный ИИ для сложных вопросов")
+        self.enabled.setChecked(bool(current.get("cloud_enabled", False)))
+        layout.addWidget(self.enabled)
+
+        form = QFormLayout()
+        self.base_url = QLineEdit(current.get("base_url", "https://api.groq.com/openai/v1"))
+        self.base_url.setPlaceholderText("https://api.groq.com/openai/v1")
+        self.model = QLineEdit(current.get("model", ""))
+        self.model.setPlaceholderText("Название модели у провайдера")
+        self.api_key = QLineEdit(current.get("api_key", ""))
+        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key.setPlaceholderText("Вставь API-ключ")
+        self.api_key.setClearButtonEnabled(True)
+        self.max_tokens = QComboBox()
+        self.max_tokens.addItems(["300", "500", "700", "1000", "1500"])
+        self.max_tokens.setCurrentText(str(current.get("max_tokens", 700)))
+        form.addRow("API endpoint:", self.base_url)
+        form.addRow("Модель:", self.model)
+        form.addRow("API-ключ:", self.api_key)
+        form.addRow("Максимум токенов ответа:", self.max_tokens)
+        layout.addLayout(form)
+
+        note = QLabel(
+            "Пример для Groq: https://api.groq.com/openai/v1\n"
+            f"Ключ хранится в локальном файле настроек Windows ({config.get_config_path()}). "
+            "Не делись этим файлом и не добавляй его в Git."
+        )
+        note.setWordWrap(True)
+        note.setObjectName("muted")
+        layout.addWidget(note)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        buttons = QHBoxLayout()
+        self.test_button = QPushButton("Проверить API")
+        self.test_button.clicked.connect(self.test_api)
+        self.save_button = QPushButton("Сохранить")
+        self.save_button.clicked.connect(self.save)
+        self.cancel_button = QPushButton("Отмена")
+        self.cancel_button.clicked.connect(self.reject)
+        buttons.addWidget(self.test_button)
+        buttons.addStretch()
+        buttons.addWidget(self.cancel_button)
+        buttons.addWidget(self.save_button)
+        layout.addLayout(buttons)
+
+    def settings_data(self):
+        return {
+            "assistant_name": self.assistant_name.text().strip() or "Джарвис",
+            "wake_word": self.wake_word.text().strip() or self.assistant_name.text().strip() or "джарвис",
+            "voice_volume": int(self.volume.currentText()),
+            "mic_device": self.mic_device.currentData(),
+            "cloud_enabled": self.enabled.isChecked(),
+            "base_url": self.base_url.text().strip().rstrip("/"),
+            "model": self.model.text().strip(),
+            "api_key": self.api_key.text().strip(),
+            "max_tokens": int(self.max_tokens.currentText()),
+        }
+
+    def save(self):
+        data = self.settings_data()
+        if data["cloud_enabled"] and not all(
+            (data["base_url"], data["model"], data["api_key"])
+        ):
+            QMessageBox.warning(
+                self, "Не заполнены настройки",
+                "Для облачного режима укажи endpoint, модель и API-ключ. "
+                "Либо отключи облачный режим."
+            )
+            return
+        try:
+            # save_config сливает значения с существующим файлом, поэтому
+            # остальные параметры (слово пробуждения, модель и т.д.) не теряются.
+            _, backup_path = config.save_config(data)
+        except OSError as exc:
+            QMessageBox.critical(self, "Ошибка сохранения", str(exc))
+            return
+        if backup_path:
+            QMessageBox.information(
+                self, "Файл настроек был повреждён",
+                "Прежний файл настроек не удалось прочитать, поэтому он сохранён "
+                f"как резервная копия:\n{backup_path}"
+            )
+        self.accept()
+
+    def test_api(self):
+        data = self.settings_data()
+        if not all((data["base_url"], data["model"], data["api_key"])):
+            QMessageBox.warning(
+                self, "Не заполнены настройки",
+                "Укажи endpoint, модель и API-ключ."
+            )
+            return
+        self.test_button.setEnabled(False)
+        self.status.setText("Проверяю подключение…")
+        self.worker = ApiTestWorker(
+            data["base_url"], data["api_key"], data["model"], self
+        )
+        self.worker.finished_text.connect(self.on_test_finished)
+        self.worker.start()
+
+    def on_test_finished(self, success, message):
+        self.test_button.setEnabled(True)
+        self.status.setText(message)
+        self.status.setStyleSheet(
+            "color: #73efb1;" if success else "color: #ff8585;"
+        )
+
+
 class JarvisGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -225,6 +431,10 @@ class JarvisGUI(QMainWindow):
 
         self.build_ui()
         self.apply_style()
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+        self.tray_icon.setToolTip("JARVIS")
+        self.tray_icon.show()
 
         self.add_chat(
             "СИСТЕМА",
@@ -291,7 +501,11 @@ class JarvisGUI(QMainWindow):
         self.clear_button.clicked.connect(self.clear_chat)
         side.addWidget(self.clear_button)
 
-        self.commands_button = QPushButton("⚙  Мои команды")
+        self.settings_button = QPushButton("⚙  Настройки")
+        self.settings_button.clicked.connect(self.open_settings)
+        side.addWidget(self.settings_button)
+
+        self.commands_button = QPushButton("☷  Мои команды")
         self.commands_button.clicked.connect(self.open_custom_commands)
         side.addWidget(self.commands_button)
 
@@ -373,6 +587,19 @@ class JarvisGUI(QMainWindow):
             QSizePolicy.Policy.Expanding,
         )
         chat_layout.addWidget(self.chat, 1)
+
+        # Текстовый ввод команды: main.py забирает его из файловой очереди
+        input_row = QHBoxLayout()
+        self.text_input = QLineEdit()
+        self.text_input.setPlaceholderText(
+            "Напиши команду текстом — Джарвис выполнит её без слова пробуждения"
+        )
+        self.text_input.returnPressed.connect(self.send_text_command)
+        self.send_button = QPushButton("Отправить")
+        self.send_button.clicked.connect(self.send_text_command)
+        input_row.addWidget(self.text_input, 1)
+        input_row.addWidget(self.send_button)
+        chat_layout.addLayout(input_row)
 
         main_panel.addWidget(chat_frame, 1)
 
@@ -608,28 +835,33 @@ class JarvisGUI(QMainWindow):
                 "#ffd479",
             )
 
-        # Явно задаём домашнюю папку Windows и кеш Hugging Face.
-        # Это предотвращает RuntimeError: Could not determine home directory.
-        home_dir = r"C:\Users\home"
-        hf_cache_dir = os.path.join(BASE_DIR, "hf_cache")
-        try:
-            os.makedirs(hf_cache_dir, exist_ok=True)
-        except OSError as exc:
-            self.add_chat(
-                "ПРЕДУПРЕЖДЕНИЕ",
-                f"Не удалось создать папку кеша {hf_cache_dir}: {exc}",
-                "#ffd479",
-            )
-
         env = self.process.processEnvironment()
         env.insert("PYTHONUNBUFFERED", "1")
         env.insert("PYTHONIOENCODING", "utf-8")
-        env.insert("USERPROFILE", home_dir)
-        env.insert("HOME", home_dir)
-        env.insert("HOMEDRIVE", "C:")
-        env.insert("HOMEPATH", r"\Users\home")
-        env.insert("HF_HOME", hf_cache_dir)
-        env.insert("HUGGINGFACE_HUB_CACHE", os.path.join(hf_cache_dir, "hub"))
+        env.insert("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+        env.insert("HF_HUB_VERBOSITY", "error")
+
+        # Передаём дочернему main.py корректные пути пользователя.
+        # Некоторые Windows-сборки Python не определяют Path.home() сами.
+        userprofile = os.environ.get("USERPROFILE") or r"C:\\Users\\home"
+        appdata = os.environ.get("APPDATA") or os.path.join(
+            userprofile, "AppData", "Roaming"
+        )
+        localappdata = os.environ.get("LOCALAPPDATA") or os.path.join(
+            userprofile, "AppData", "Local"
+        )
+        env.insert("USERPROFILE", userprofile)
+        env.insert("HOME", userprofile)
+        env.insert("APPDATA", appdata)
+        env.insert("LOCALAPPDATA", localappdata)
+
+        # Не позволяем Hugging Face выбирать кэш через Path.home().
+        hf_home = os.path.join(BASE_DIR, "cache", "huggingface")
+        hf_hub_cache = os.path.join(hf_home, "hub")
+        os.makedirs(hf_hub_cache, exist_ok=True)
+        env.insert("HF_HOME", hf_home)
+        env.insert("HF_HUB_CACHE", hf_hub_cache)
+
         self.process.setProcessEnvironment(env)
 
         self.output_buffer = ""
@@ -685,19 +917,35 @@ class JarvisGUI(QMainWindow):
             or "assistant ready" in lower
         ):
             self.assistant_ready = True
-            self.set_status("ГОТОВА", "statusReady")
+            self.set_status("ГОТОВ", "statusReady")
             self.card_voice.value_label.setText("Ожидание команды")
             self.card_model.value_label.setText("Загружена")
             self.add_chat("СИСТЕМА", line, "#73efb1")
             return
 
+        if lower.startswith(("пробуждение:", "wake detected:")):
+            name = line.split(":", 1)[-1].strip() or config.load_config().get("assistant_name", "Ассистент")
+            self.card_voice.value_label.setText("Активирован")
+            self.add_chat("🔔 АССИСТЕНТ СЛУШАЕТ", f"{name} услышал тебя. Говори команду.", "#73efb1")
+            try:
+                if hasattr(self, "tray_icon") and self.tray_icon.isVisible():
+                    self.tray_icon.showMessage(
+                        "Ассистент слушает",
+                        f"{name} услышал тебя. Говори команду.",
+                        self.tray_icon.MessageIcon.Information,
+                        4000,
+                    )
+            except Exception:
+                pass
+            return
+
         # Текст распознанной речи
         if lower.startswith(("слышу:", "услышала:", "wake:", "wake word:")):
             self.card_voice.value_label.setText("Слушает")
-            self.add_chat("🎙️ АЛИСКА УСЛЫШАЛА", line.split(":", 1)[-1], "#67d8ff")
+            self.add_chat("🎙️ ДЖАРВИС УСЛЫШАЛ", line.split(":", 1)[-1], "#67d8ff")
             return
 
-        if lower.startswith(("ты:", "пользователь:", "распознано:", "распознано:")):
+        if lower.startswith(("ты:", "ты (текст):", "пользователь:", "распознано:")):
             self.card_voice.value_label.setText("Речь распознана")
             self.add_chat("🧑 ТЫ", line.split(":", 1)[-1], "#d8a5ff")
             return
@@ -722,6 +970,33 @@ class JarvisGUI(QMainWindow):
 
         # Остальные сообщения тоже не теряем
         self.add_chat("ЖУРНАЛ", line, "#a9b8d4")
+
+    def send_text_command(self):
+        text = self.text_input.text().strip()
+        if not text:
+            return
+        self.text_input.clear()
+
+        if self.process.state() == QProcess.ProcessState.NotRunning:
+            self.add_chat(
+                "СИСТЕМА",
+                "Джарвис не запущен. Нажми «Запустить Джарвиса».",
+                "#ffd479",
+            )
+            return
+
+        try:
+            os.makedirs(TEXT_COMMAND_DIR, exist_ok=True)
+            filename = "{:%Y%m%d-%H%M%S}-{}.txt".format(
+                datetime.now(), os.urandom(4).hex()
+            )
+            with open(os.path.join(TEXT_COMMAND_DIR, filename), "w", encoding="utf-8") as file:
+                file.write(text)
+        except OSError as exc:
+            self.add_chat("ОШИБКА", f"Не удалось передать команду: {exc}", "#ff8585")
+            return
+
+        self.add_chat("🧑 ТЫ (текст)", text, "#d8a5ff")
 
     def stop_jarvis(self):
         if self.process.state() == QProcess.ProcessState.NotRunning:
@@ -793,8 +1068,51 @@ class JarvisGUI(QMainWindow):
             self.set_status("ОШИБКА", "statusStopped")
 
     def open_custom_commands(self):
-        dialog = CustomCommandsDialog(self)
-        dialog.exec()
+        # Редактор сохраняет команды в custom_commands.json, который читает main.py.
+        self.commands_dialog = CustomCommandsDialog(self)
+        self.commands_dialog.setWindowTitle("Мои команды Джарвиса")
+        self.commands_dialog.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowSystemMenuHint
+            | Qt.WindowType.WindowCloseButtonHint
+            | Qt.WindowType.WindowMinMaxButtonsHint
+        )
+        self.commands_dialog.setModal(False)
+        self.commands_dialog.setMinimumSize(620, 560)
+        self.commands_dialog.setStyleSheet("""
+            QWidget { background-color: #0b1020; color: #e8eefc; }
+            QLabel#muted { color: #8291ad; }
+            QLineEdit, QComboBox, QListWidget {
+                background-color: #0d1425; color: #e8eefc;
+                border: 1px solid #2a3a5b; border-radius: 6px; padding: 7px;
+            }
+            QPushButton { background-color: #1b2740; border: 1px solid #2a3a5b;
+                border-radius: 8px; padding: 9px; color: #e8eefc; font-weight: 600; }
+            QPushButton:hover { background-color: #263856; border-color: #67d8ff; }
+        """)
+        # Показываем отдельное окно, а не дочерний виджет в левом верхнем углу.
+        self.commands_dialog.adjustSize()
+        self.commands_dialog.show()
+        self.commands_dialog.raise_()
+        self.commands_dialog.activateWindow()
+        parent_frame = self.frameGeometry()
+        dialog_frame = self.commands_dialog.frameGeometry()
+        dialog_frame.moveCenter(parent_frame.center())
+        self.commands_dialog.move(dialog_frame.topLeft())
+
+    def open_settings(self):
+        dialog = SettingsDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.add_chat(
+                "СИСТЕМА",
+                "Настройки сохранены. Микрофон и слово пробуждения применятся "
+                "при следующем запуске, облачный ИИ — при следующем запросе.",
+                "#73efb1",
+            )
+            self.card_model.value_label.setText(
+                "Гибридная" if dialog.settings_data()["cloud_enabled"] else "Локальная"
+            )
 
     def clear_chat(self):
         self.chat.clear()

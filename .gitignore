@@ -16,6 +16,8 @@ models/
 *.log
 *.tmp
 jarvis_stop.flag
+jarvis_text_commands/
+*.bak*-20261015
 
 # Секреты и локальные настройки
 .env
