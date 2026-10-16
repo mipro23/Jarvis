@@ -38,5 +38,10 @@
     "phrase": "почта",
     "action": "open_site",
     "target": "https://mail.google.com/mail/u/0/#inbox"
+  },
+  {
+    "phrase": "вадим",
+    "action": "open_app",
+    "target": "https://telemost.yandex.ru/j/89296660396527"
   }
 ]

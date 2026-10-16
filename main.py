@@ -1,6 +1,7 @@
 import mss
 from PIL import Image
 import json
+import difflib
 import os
 import re
 import sys
@@ -166,16 +167,16 @@ MIC_DEVICE = None
 WAKE_CHUNK_SECONDS = 2
 
 # Сколько тишины означает, что фраза закончилась
-END_SILENCE_SECONDS = 0.8
+END_SILENCE_SECONDS = 1.1
 
 # Максимальное время ожидания команды
 MAX_COMMAND_SECONDS = 12
 
 # Минимальная длительность речи, чтобы не принять шум за команду
-MIN_SPEECH_SECONDS = 0.25
+MIN_SPEECH_SECONDS = 0.20
 
 # Начальный запас аудио, чтобы не обрезать первые слова
-PRE_ROLL_SECONDS = 0.3
+PRE_ROLL_SECONDS = 0.5
 
 # Минимальная громкость речи; при необходимости настроим
 SPEECH_THRESHOLD = 0.006
@@ -187,7 +188,20 @@ SYSTEM = """
 Ты Джарвис — локальный голосовой помощник Windows 11.
 Всегда отвечай на русском языке, кратко и дружелюбно.
 
-Для команд управления компьютером возвращай JSON:
+ВАЖНО: пользователь говорит голосом, а входной текст получен через Whisper.
+В распознанном тексте могут быть пропущенные слова, ошибки, омонимы,
+слова-паразиты и неверно распознанные названия приложений или сайтов.
+Сначала определи наиболее вероятный смысл фразы с учётом контекста,
+затем выбери действие. Не требуй дословного совпадения с командой.
+Например, «включи ютуб», «зайди где видео смотрят» и «открой, ну, ютуб»
+могут означать открытие сайта YouTube.
+
+Не додумывай отсутствующие важные детали. Если смысл действительно
+неоднозначен, не выполняй действие: верни action="none" и задай короткий
+уточняющий вопрос на русском. Если фраза явно является вопросом или просьбой
+объяснить что-то, ответь на неё в поле reply, не превращая её в команду Windows.
+
+Для команд управления компьютером возвращай только JSON следующего вида:
 {"action":"none","target":"","reply":"Ответ пользователю"}
 
 Допустимые действия:
@@ -196,9 +210,12 @@ restore_window, switch_window, close_window, none.
 
 Приложения: notepad, calculator, explorer, browser.
 Сайты: google, youtube, wikipedia.
-Для окон target оставляй пустым.
-Не выдумывай результат выполнения.
-Не возвращай код или команды оболочки.
+Для open_app target должен быть одним из перечисленных ключей приложений.
+Для open_site target должен быть одним из перечисленных ключей сайтов.
+Для действий с окнами target оставляй пустым.
+Закрытие окон отключено: не пытайся обходить это ограничение.
+Не выдумывай результат выполнения и не утверждай, что действие выполнено.
+Не возвращай код, команды оболочки, дополнительные поля или Markdown.
 """
 
 APPS = {
@@ -394,23 +411,79 @@ def record_audio(seconds):
 
 
 def transcribe(whisper, audio):
+    """Распознаёт русскую речь с настройками для коротких голосовых команд."""
+    audio = np.asarray(audio, dtype=np.float32).flatten()
+    if audio.size == 0:
+        return ""
+
+    # Убираем DC-смещение, которое иногда появляется у микрофонов.
+    audio = audio - float(np.mean(audio))
+
     segments, _ = whisper.transcribe(
         audio,
         language="ru",
+        task="transcribe",
+        beam_size=5,
+        best_of=5,
+        temperature=0.0,
+        condition_on_previous_text=False,
         vad_filter=True,
+        vad_parameters={
+            "threshold": 0.35,
+            "min_speech_duration_ms": 120,
+            "min_silence_duration_ms": 350,
+            "speech_pad_ms": 250,
+        },
+        initial_prompt=(
+            "Русский язык. Голосовые команды для компьютера. "
+            "Джарвис, открой браузер, открой YouTube, открой настройки, "
+            "закрой окно, переключи окно, сверни окно, разверни окно, "
+            "какая погода, который час, найди информацию."
+        ),
     )
-    text = " ".join(s.text.strip() for s in segments).strip()
-    return text
+    return " ".join(segment.text.strip() for segment in segments).strip()
 
 
 
+
+
+def _normalize_wake_text(value):
+    """Нормализует результат Whisper перед поиском слова активации."""
+    value = str(value or "").lower().replace("ё", "е")
+    value = value.replace("джарвис", "джарвис")
+    return re.sub(r"[^а-яa-z0-9]+", " ", value).strip()
+
+
+def _contains_wake_word(text):
+    """Ищет имя ассистента с допуском к частым ошибкам Whisper."""
+    normalized = _normalize_wake_text(text)
+    if not normalized:
+        return False
+
+    tokens = normalized.split()
+    configured = [_normalize_wake_text(word) for word in WAKE_WORDS]
+    configured = [word for word in configured if word]
+    # Добавляем распространённые варианты распознавания имени.
+    candidates = set(configured + ["джарвис", "жарвис", "джервис", "jarvis"])
+
+    for token in tokens:
+        if token in candidates:
+            return True
+        # Сравниваем только слова похожей длины, чтобы не будить ассистента
+        # на случайных длинных словах. Порог допускает одну ошибку в имени.
+        for candidate in candidates:
+            if abs(len(token) - len(candidate)) <= 2:
+                ratio = difflib.SequenceMatcher(None, token, candidate).ratio()
+                if ratio >= 0.76:
+                    return True
+    return False
 
 
 def wait_for_wake_word(whisper):
-    """Ожидает слово пробуждения «Джарвис».
+    """Ожидает имя ассистента, учитывая варианты распознавания Whisper.
 
     Возвращает текстовую команду из GUI, если она пришла во время ожидания,
-    иначе None. Stop-флаг проверяется на каждом шаге для быстрой остановки.
+    иначе None. Строка «Слышу» печатается для диагностики распознавания.
     """
     while True:
         if stop_requested():
@@ -421,18 +494,21 @@ def wait_for_wake_word(whisper):
             print("Ты (текст):", text_command, flush=True)
             return text_command
 
-        audio = record_audio(3)
-        text = transcribe(whisper, audio)
+        try:
+            audio = record_audio(3)
+            text = transcribe(whisper, audio)
+        except Exception as error:
+            print(f"Ошибка прослушивания имени: {error}", flush=True)
+            time.sleep(0.25)
+            continue
 
         if not text:
             continue
 
         print("Слышу:", text, flush=True)
 
-        normalized = re.sub(r"[^\w\s]", " ", text.lower())
-        words = normalized.split()
-
-        if any(word in WAKE_WORDS for word in words):
+        if _contains_wake_word(text):
+            print("Ключевое слово распознано.", flush=True)
             return None
 
 
@@ -467,7 +543,7 @@ def listen_for_command(whisper):
     # Сначала оцениваем фоновый шум
     noise_levels = []
 
-    print("СЛУШАЮ КОМАНДУ: говори сейчас.", flush=True)
+    print("Слушаю команду. Говори после сигнала...")
 
     try:
         with sd.InputStream(
@@ -480,8 +556,6 @@ def listen_for_command(whisper):
 
             while True:
                 data, overflowed = stream.read(block_size)
-                if overflowed:
-                    print("Предупреждение: микрофон не успевает передавать аудио.", flush=True)
                 if stop_requested():
                     return ""
 
@@ -503,11 +577,9 @@ def listen_for_command(whisper):
                     float(np.median(noise_levels))
                     if noise_levels else 0.0
                 )
-                # Более мягкий адаптивный порог: 0.012 был слишком высоким
-                # для некоторых встроенных микрофонов и тихой речи.
                 threshold = max(
                     SPEECH_THRESHOLD,
-                    noise_level * 2.5,
+                    noise_level * 3.0,
                 )
 
                 rms = float(np.sqrt(np.mean(chunk * chunk)))
@@ -521,7 +593,7 @@ def listen_for_command(whisper):
                         audio_parts.extend(list(pre_roll))
                         speech_blocks = 1
                         silence_blocks = 0
-                        print("РЕЧЬ ОБНАРУЖЕНА, записываю...", flush=True)
+                        print("Речь обнаружена...")
                     continue
 
                 audio_parts.append(chunk)
@@ -545,12 +617,12 @@ def listen_for_command(whisper):
         return ""
 
     if not speech_started or not audio_parts:
-        print("РЕЧЬ НЕ ОБНАРУЖЕНА: проверь громкость и устройство микрофона.", flush=True)
+        print("Речь не обнаружена.")
         return ""
 
     audio = np.concatenate(audio_parts).astype(np.float32)
 
-    print("РАСПОЗНАЮ КОМАНДУ...", flush=True)
+    print("Распознаю команду...")
     text = transcribe(whisper, audio)
 
     if text:
@@ -780,7 +852,11 @@ def handle_command(text, voice):
             model=MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": text},
+                {"role": "user", "content": (
+                    "Распознанная Whisper фраза пользователя: «" + text + "». "
+                    "Определи намерение, учитывая возможные ошибки распознавания. "
+                    "Верни только JSON по заданной схеме."
+                )},
             ],
             format="json",
             options={"temperature": 0},
@@ -850,8 +926,14 @@ def main():
     voice = PiperVoice.load(str(voice_model_path))
 
     print("Загружаю Faster-Whisper...")
+    # base — умеренная нагрузка; small обычно точнее для русского,
+    # но требует больше оперативной памяти и работает медленнее.
+    whisper_model_name = str(CFG.get("whisper_model", "base")).strip() or "base"
+    if whisper_model_name not in {"base", "small", "medium"}:
+        whisper_model_name = "base"
+    print(f"Модель распознавания речи: {whisper_model_name}", flush=True)
     whisper = WhisperModel(
-        "base",
+        whisper_model_name,
         device="cpu",
         compute_type="int8",
     )
@@ -881,10 +963,6 @@ def main():
                 break
 
             command = listen_for_command(whisper)
-
-            if not command:
-                print("Команда не получена. Возвращаюсь к ожиданию ключевого слова.", flush=True)
-                continue
 
             if stop_requested():
                 break
