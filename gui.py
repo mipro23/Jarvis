@@ -25,8 +25,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QFormLayout,
     QMessageBox,
-    QSystemTrayIcon,
-    QStyle,
 )
 
 
@@ -261,19 +259,6 @@ class SettingsDialog(QDialog):
         intro.setObjectName("muted")
         layout.addWidget(intro)
 
-        identity_form = QFormLayout()
-        self.assistant_name = QLineEdit(str(current.get("assistant_name", "Джарвис")))
-        self.assistant_name.setPlaceholderText("Например: Нексус")
-        self.wake_word = QLineEdit(str(current.get("wake_word", "джарвис")))
-        self.wake_word.setPlaceholderText("Слова через запятую, например: нексус, помощник")
-        self.volume = QComboBox()
-        self.volume.addItems(["25", "40", "55", "70", "85", "100"])
-        self.volume.setCurrentText(str(current.get("voice_volume", 85)))
-        identity_form.addRow("Имя ассистента:", self.assistant_name)
-        identity_form.addRow("Слово пробуждения:", self.wake_word)
-        identity_form.addRow("Громкость голоса (%):", self.volume)
-        layout.addLayout(identity_form)
-
         mic_form = QFormLayout()
         devices = config.list_input_devices()
         self.mic_device = QComboBox()
@@ -317,6 +302,44 @@ class SettingsDialog(QDialog):
         form.addRow("Максимум токенов ответа:", self.max_tokens)
         layout.addLayout(form)
 
+        # Fish Audio TTS settings. Secrets are stored only in the local config file.
+        fish_title = QLabel("Озвучка Fish Audio")
+        fish_title.setStyleSheet("font-weight: 600; font-size: 15px; margin-top: 8px;")
+        layout.addWidget(fish_title)
+        self.fish_enabled = QCheckBox("Использовать Fish Audio для озвучивания")
+        self.fish_enabled.setChecked(bool(current.get("fish_enabled", True)))
+        layout.addWidget(self.fish_enabled)
+
+        fish_form = QFormLayout()
+        self.fish_api_key = QLineEdit(str(current.get("fish_api_key", "")))
+        self.fish_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.fish_api_key.setPlaceholderText("Вставь ключ Fish Audio")
+        self.fish_api_key.setClearButtonEnabled(True)
+        self.fish_voice_id = QLineEdit(str(current.get("fish_voice_id", "")))
+        self.fish_voice_id.setPlaceholderText("ID reference/клонированного голоса")
+        self.fish_model = QComboBox()
+        self.fish_model.addItems(["s2.1-pro-free", "s2.1-pro", "s1"] )
+        saved_fish_model = str(current.get("fish_model", "s2.1-pro-free"))
+        if self.fish_model.findText(saved_fish_model) < 0:
+            self.fish_model.addItem(saved_fish_model)
+        self.fish_model.setCurrentText(saved_fish_model)
+        self.fish_speed = QComboBox()
+        self.fish_speed.addItems(["0.80", "0.90", "1.00", "1.10", "1.20", "1.25", "1.30", "1.40", "1.50", "1.60", "1.80", "2.00"])
+        self.fish_speed.setCurrentText(f"{float(current.get('fish_speed', 1.25)):.2f}")
+        fish_form.addRow("Fish Audio API-ключ:", self.fish_api_key)
+        fish_form.addRow("ID голоса:", self.fish_voice_id)
+        fish_form.addRow("Модель озвучивания:", self.fish_model)
+        fish_form.addRow("Скорость речи:", self.fish_speed)
+        layout.addLayout(fish_form)
+
+        fish_note = QLabel(
+            "Fish Audio требует интернет. Если сервис недоступен, Джарвис попробует Piper. "
+            "Ключ хранится локально в config.json; не публикуй этот файл и не добавляй его в Git."
+        )
+        fish_note.setWordWrap(True)
+        fish_note.setObjectName("muted")
+        layout.addWidget(fish_note)
+
         note = QLabel(
             "Пример для Groq: https://api.groq.com/openai/v1\n"
             f"Ключ хранится в локальном файле настроек Windows ({config.get_config_path()}). "
@@ -345,15 +368,17 @@ class SettingsDialog(QDialog):
 
     def settings_data(self):
         return {
-            "assistant_name": self.assistant_name.text().strip() or "Джарвис",
-            "wake_word": self.wake_word.text().strip() or self.assistant_name.text().strip() or "джарвис",
-            "voice_volume": int(self.volume.currentText()),
             "mic_device": self.mic_device.currentData(),
             "cloud_enabled": self.enabled.isChecked(),
             "base_url": self.base_url.text().strip().rstrip("/"),
             "model": self.model.text().strip(),
             "api_key": self.api_key.text().strip(),
             "max_tokens": int(self.max_tokens.currentText()),
+            "fish_enabled": self.fish_enabled.isChecked(),
+            "fish_api_key": self.fish_api_key.text().strip(),
+            "fish_voice_id": self.fish_voice_id.text().strip(),
+            "fish_model": self.fish_model.currentText().strip() or "s2.1-pro",
+            "fish_speed": float(self.fish_speed.currentText()),
         }
 
     def save(self):
@@ -365,6 +390,20 @@ class SettingsDialog(QDialog):
                 self, "Не заполнены настройки",
                 "Для облачного режима укажи endpoint, модель и API-ключ. "
                 "Либо отключи облачный режим."
+            )
+            return
+        if data["fish_enabled"] and not data["fish_api_key"]:
+            QMessageBox.warning(
+                self, "Не указан ключ Fish Audio",
+                "Вставь API-ключ Fish Audio или отключи использование Fish Audio. "
+                "Piper останется резервным голосом."
+            )
+            return
+        if data["fish_enabled"] and not data["fish_voice_id"]:
+            QMessageBox.warning(
+                self, "Не указан ID голоса",
+                "Укажи ID разрешённого голоса Fish Audio. Можно сохранить настройки, "
+                "отключив Fish Audio до тех пор, пока ID не будет готов."
             )
             return
         try:
@@ -431,10 +470,6 @@ class JarvisGUI(QMainWindow):
 
         self.build_ui()
         self.apply_style()
-        self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
-        self.tray_icon.setToolTip("JARVIS")
-        self.tray_icon.show()
 
         self.add_chat(
             "СИСТЕМА",
@@ -921,22 +956,6 @@ class JarvisGUI(QMainWindow):
             self.card_voice.value_label.setText("Ожидание команды")
             self.card_model.value_label.setText("Загружена")
             self.add_chat("СИСТЕМА", line, "#73efb1")
-            return
-
-        if lower.startswith(("пробуждение:", "wake detected:")):
-            name = line.split(":", 1)[-1].strip() or config.load_config().get("assistant_name", "Ассистент")
-            self.card_voice.value_label.setText("Активирован")
-            self.add_chat("🔔 АССИСТЕНТ СЛУШАЕТ", f"{name} услышал тебя. Говори команду.", "#73efb1")
-            try:
-                if hasattr(self, "tray_icon") and self.tray_icon.isVisible():
-                    self.tray_icon.showMessage(
-                        "Ассистент слушает",
-                        f"{name} услышал тебя. Говори команду.",
-                        self.tray_icon.MessageIcon.Information,
-                        4000,
-                    )
-            except Exception:
-                pass
             return
 
         # Текст распознанной речи

@@ -635,9 +635,82 @@ def listen_for_command(whisper):
 
 # ============== ОЗВУЧИВАНИЕ ==============
 
+FISH_TTS_URL = "https://api.fish.audio/v1/tts"
+
+
+def fish_tts_enabled():
+    cfg = config.load_config()
+    return bool(cfg.get("fish_enabled") and cfg.get("fish_api_key")
+                and str(cfg.get("fish_voice_id", "")).strip())
+
+
+def speak_with_fish(text):
+    """Синтез речи через бесплатную модель Fish Audio."""
+    cfg = config.load_config()
+    api_key = str(cfg.get("fish_api_key", "")).strip()
+    voice_id = str(cfg.get("fish_voice_id", "")).strip()
+    speed = float(cfg.get("fish_speed", 1.0))
+    if not api_key:
+        raise RuntimeError("Не указан API-ключ Fish Audio.")
+    if not voice_id:
+        raise RuntimeError("Не указан ID голоса Fish Audio.")
+
+    payload = {
+        "text": text,
+        "reference_id": voice_id,
+        "format": "wav",
+    }
+    request = urllib.request.Request(
+        FISH_TTS_URL,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "model": "s2.1-pro-free",
+        },
+        method="POST",
+    )
+    timeout = max(10, min(int(cfg.get("timeout_seconds", 35)), 90))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            wav_bytes = response.read()
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace")[:200]
+        raise RuntimeError(f"Fish Audio: HTTP {error.code} {detail}") from error
+    if not wav_bytes:
+        raise RuntimeError("Fish Audio вернул пустой ответ.")
+
+    wav_path = Path(__file__).parent / "jarvis_speech.wav"
+    wav_path.write_bytes(wav_bytes)
+
+    with wave.open(str(wav_path), "rb") as wav_file:
+        rate = wav_file.getframerate()
+        channels = wav_file.getnchannels()
+        audio = np.frombuffer(
+            wav_file.readframes(wav_file.getnframes()),
+            dtype=np.int16,
+        ).copy()
+
+    audio = audio.reshape(-1, channels).astype(np.float32) / 32768.0
+    sd.play(audio, rate)
+    sd.wait()
+
+
 def speak(voice, text):
     if not text:
         return
+
+    if fish_tts_enabled():
+        try:
+            speak_with_fish(text)
+            # Даём микрофону время, чтобы не принять конец озвучивания за команду
+            time.sleep(0.5)
+            return
+        except Exception as error:
+            print(
+                f"Fish Audio недоступен ({error}); озвучиваю локальным Piper.",
+                flush=True,
+            )
 
     wav_path = Path(__file__).parent / "jarvis_speech.wav"
 
